@@ -3,7 +3,12 @@
 //! This crate provides an opinionated, high-level interface for some Linux page cache inspection
 //! and manipulation system calls.
 
-use std::{fs, io, num, os::unix::prelude::IntoRawFd, path::Path, ptr};
+use std::{
+    fs, io, num,
+    os::unix::prelude::IntoRawFd,
+    path::{Path, PathBuf},
+    ptr,
+};
 
 use bitvec::vec::BitVec;
 
@@ -11,51 +16,55 @@ use bitvec::vec::BitVec;
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// Failed to retrieve configured page size using `libc::sysconf(libc::_SC_PAGESIZE)`.
-    #[error("failed to retrieve page size")]
-    PageSizeError(io::Error),
+    #[error("Failed to retrieve page size")]
+    PageSizeError(#[source] io::Error),
 
     /// Forwarded [`std::io::Error`], returned from the attempt to `open(2)` a file (using
     /// [`std::fs::OpenOptions`]).
-    #[error("failed to open file")]
-    OpenError(io::Error),
+    #[error("Failed to open(2) file {0:?}")]
+    OpenError(PathBuf, #[source] io::Error),
 
     /// Forwarded [`std::io::Error`], returned from the attempt to `stat(2)` a file (using
     /// [`std::fs::File::metadata`]).
-    #[error("failed to open file")]
-    StatError(io::Error),
+    #[error("Failed to stat(2) file {0:?}")]
+    StatError(PathBuf, #[source] io::Error),
 
     /// Forwarded [`std::num::TryFromIntError`], returned from the attempt to convert the `u64`
     /// file length (returned by [`std::fs::File::metadata`]) into a `i64` (as required by
     /// `libc::posix_fadvise64`).
-    #[error("failed to convert file length from u64 to i64")]
+    #[error("Failed to convert file length from u64 to i64")]
     TryFromIntError(#[from] num::TryFromIntError),
 
     /// A [`std::io::Error`] built from the error code returned by `libc::posix_fadvise64`.
     #[error("posix_fadvise64(2) failed")]
-    PosixFadvise64Error(io::Error),
+    PosixFadvise64Error(#[source] io::Error),
 
     /// A [`std::io::Error`] built from the errno set by `libc::mmap`.
     #[error("mmap(2) failed")]
-    MmapError(io::Error),
+    MmapError(#[source] io::Error),
 
     /// A [`std::io::Error`] built from the errno set by `libc::munmap`.
     #[error("munmap(2) failed")]
-    MunmapError(io::Error),
+    MunmapError(#[source] io::Error),
 
     /// A [`std::io::Error`] built from the errno set by `libc::mincore`.
     #[error("mincore(2) failed")]
-    MincoreError(io::Error),
+    MincoreError(#[source] io::Error),
 }
 
 /// Hint Linux to remove the file at `path` from the page cache.
 pub fn fforget(path: impl AsRef<Path>) -> Result<(), Error> {
     let f = fs::OpenOptions::new()
         .read(true)
-        .open(path)
-        .map_err(Error::OpenError)?;
-    let len = f.metadata().map_err(Error::StatError)?.len().try_into()?;
+        .open(&path)
+        .map_err(|err| Error::OpenError(path.as_ref().to_path_buf(), err))?;
+    let len = f
+        .metadata()
+        .map_err(|err| Error::StatError(path.as_ref().to_path_buf(), err))?
+        .len()
+        .try_into()?;
 
-    // SAFETY: FFI call to libc with safe parameters
+    // SAFETY: call to libc with safe parameters
     match unsafe { libc::posix_fadvise64(f.into_raw_fd(), 0, len, libc::POSIX_FADV_DONTNEED) } {
         0 => Ok(()),
         er => Err(Error::PosixFadvise64Error(io::Error::from_raw_os_error(er))),
@@ -150,11 +159,15 @@ pub fn mincore(path: impl AsRef<Path>) -> Result<Mincore, Error> {
 pub fn mincore_raw(path: impl AsRef<Path>) -> Result<Vec<u8>, Error> {
     let f = fs::OpenOptions::new()
         .read(true)
-        .open(path)
-        .map_err(Error::OpenError)?;
-    let len = f.metadata().map_err(Error::StatError)?.len().try_into()?;
+        .open(&path)
+        .map_err(|err| Error::OpenError(path.as_ref().to_path_buf(), err))?;
+    let len = f
+        .metadata()
+        .map_err(|err| Error::StatError(path.as_ref().to_path_buf(), err))?
+        .len()
+        .try_into()?;
 
-    // SAFETY: FFI call to libc with checked parameters
+    // SAFETY: call to libc with checked parameters
     let f_map = unsafe {
         libc::mmap(
             ptr::null_mut(),
@@ -172,12 +185,12 @@ pub fn mincore_raw(path: impl AsRef<Path>) -> Result<Vec<u8>, Error> {
     let page_size = page_size()?;
     let mut vec = vec![0; (len + page_size - 1) / page_size];
 
-    // SAFETY: FFI call to libc with checked parameters
+    // SAFETY: call to libc with checked parameters
     if -1 == unsafe { libc::mincore(f_map, len, vec.as_mut_ptr()) } {
         return Err(Error::MincoreError(io::Error::last_os_error()));
     }
 
-    // SAFETY: FFI call to libc with checked parameters
+    // SAFETY: call to libc with checked parameters
     if -1 == unsafe { libc::munmap(f_map, len) } {
         return Err(Error::MunmapError(io::Error::last_os_error()));
     }
@@ -187,7 +200,7 @@ pub fn mincore_raw(path: impl AsRef<Path>) -> Result<Vec<u8>, Error> {
 
 /// Retrieve system's page size in bytes.
 pub fn page_size() -> Result<usize, Error> {
-    // SAFETY: FFI call to libc with safe parameters
+    // SAFETY: call to libc with safe parameters
     match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
         -1 => Err(Error::PageSizeError(io::Error::last_os_error())),
         size => Ok(size as usize),
